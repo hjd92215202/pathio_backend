@@ -1,7 +1,7 @@
 use axum::{
     extract::{State, Path},
     http::StatusCode,
-    routing::{get, put},
+    routing::{get, put, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -9,10 +9,25 @@ use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
+use bcrypt::{hash, verify, DEFAULT_COST};
+use jsonwebtoken::{encode, Header, EncodingKey};
 
 // ==========================================
 // 1. 数据模型定义
 // ==========================================
+
+#[derive(Serialize, Deserialize)]
+pub struct Claims {
+    pub sub: Uuid,      // 用户 ID
+    pub exp: usize,     // 过期时间
+}
+
+#[derive(Deserialize)]
+pub struct AuthReq {
+    pub username: String,       // 对应数据库中的 nickname
+    pub email: Option<String>,  // 注册时必填，登录时可选
+    pub password: String,
+}
 
 #[derive(Serialize, Deserialize, FromRow)]
 pub struct Node {
@@ -83,6 +98,61 @@ pub struct ShareData {
 // ==========================================
 // 2. API 处理函数 (Handlers)
 // ==========================================
+
+// 注册接口：创建用户 + 自动创建默认组织
+async fn register(
+    State(pool): State<PgPool>,
+    Json(payload): Json<AuthReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let hashed = hash(payload.password, DEFAULT_COST).unwrap();
+    let email = payload.email.ok_or((StatusCode::BAD_REQUEST, "邮箱必填".to_string()))?;
+    
+    let mut tx = pool.begin().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 插入数据：nickname = username, email = email
+    let user_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (nickname, email, password_hash) VALUES ($1, $2, $3) RETURNING id"
+    )
+    .bind(payload.username)
+    .bind(email)
+    .bind(hashed)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| (StatusCode::BAD_REQUEST, "用户名或邮箱已被占用".to_string()))?;
+
+    // 自动创建默认组织
+    sqlx::query("INSERT INTO organizations (name, owner_id) VALUES ($1, $2)")
+        .bind("我的空间")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    tx.commit().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::CREATED)
+}
+
+// 登录接口：验证密码 + 返回 JWT
+async fn login(
+    State(pool): State<PgPool>,
+    Json(payload): Json<AuthReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // 通过 nickname (用户名) 查找用户
+    let (id, hash_val): (Uuid, String) = sqlx::query_as("SELECT id, password_hash FROM users WHERE nickname = $1")
+        .bind(payload.username)
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .ok_or((StatusCode::UNAUTHORIZED, "用户不存在".to_string()))?;
+
+    if verify(payload.password, &hash_val).unwrap() {
+        let claims = Claims { sub: id, exp: 10000000000 }; 
+        let token = encode(&Header::default(), &claims, &EncodingKey::from_secret("secret".as_ref())).unwrap();
+        Ok(Json(serde_json::json!({ "token": token })))
+    } else {
+        Err((StatusCode::UNAUTHORIZED, "密码错误".to_string()))
+    }
+}
 
 // 根据 share_token 获取整个路线图的数据 (只读)
 async fn get_shared_roadmap(
@@ -260,11 +330,16 @@ async fn main() {
     // 配置路由
     let app = Router::new()
         .route("/api/health", get(health_check))
+        // 1. 注册认证相关路由
+        .route("/api/auth/register", post(register))
+        .route("/api/auth/login", post(login))
+        // 2. 节点与连线路由
         .route("/api/nodes", get(get_all_nodes).post(create_node))
         .route("/api/nodes/:id/position", put(update_node_position))
-        .route("/api/edges", get(get_all_edges).post(create_edge)) 
+        .route("/api/edges", get(get_all_edges).post(create_edge))
         .route("/api/nodes/:id/note", get(get_node_note).put(update_node_note))
         .route("/api/share/:token", get(get_shared_roadmap))
+        // 中间件与状态
         .layer(CorsLayer::permissive())
         .with_state(pool);
 

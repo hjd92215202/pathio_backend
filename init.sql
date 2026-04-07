@@ -74,3 +74,9 @@ UPDATE nodes SET roadmap_id = (SELECT id FROM roadmaps WHERE share_token = 'path
 
 -- 3. 将你目前所有的连线也归属过去
 UPDATE edges SET roadmap_id = (SELECT id FROM roadmaps WHERE share_token = 'path123');
+
+-- 1. 确保 nickname 不能为空 (请确保表中现有数据 nickname 都有值，否则会报错)
+ALTER TABLE users ALTER COLUMN nickname SET NOT NULL;
+
+-- 2. 确保 nickname 全局唯一（因为要用来登录）
+ALTER TABLE users ADD CONSTRAINT users_nickname_unique UNIQUE (nickname);
