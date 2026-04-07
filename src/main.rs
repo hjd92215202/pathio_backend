@@ -1,38 +1,38 @@
 use axum::{
-    extract::{State, Path},
+    extract::{State, Path, FromRequestParts, Query},
     http::StatusCode,
     routing::{get, put, post},
     Json, Router,
 };
+use axum::http::request::Parts;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 use bcrypt::{hash, verify, DEFAULT_COST};
-use jsonwebtoken::{encode, Header, EncodingKey};
+use jsonwebtoken::{encode, Header, EncodingKey, decode, DecodingKey, Validation};
 
 // ==========================================
 // 1. 数据模型定义
 // ==========================================
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: Uuid,      // 用户 ID
-    pub exp: usize,     // 过期时间
+    pub sub: Uuid,
+    pub exp: usize,
 }
 
 #[derive(Deserialize)]
 pub struct AuthReq {
-    pub username: String,       // 对应数据库中的 nickname
-    pub email: Option<String>,  // 注册时必填，登录时可选
+    pub username: String,
+    pub email: Option<String>,
     pub password: String,
 }
 
 #[derive(Serialize, Deserialize, FromRow)]
 pub struct Node {
     pub id: Uuid,
-    // 暂时用 Option，因为前端刚刚创建的节点可能还没归属路线图
     pub roadmap_id: Option<Uuid>, 
     pub title: String,
     pub status: Option<String>,
@@ -40,15 +40,20 @@ pub struct Node {
     pub pos_y: f64,
 }
 
-// 接收前端创建节点的请求体
+// 接收前端过滤参数
+#[derive(Deserialize)]
+pub struct RoadmapQuery {
+    pub roadmap_id: Uuid,
+}
+
 #[derive(Deserialize)]
 pub struct CreateNodeReq {
+    pub roadmap_id: Uuid, // 显式要求归属
     pub title: String,
     pub pos_x: f64,
     pub pos_y: f64,
 }
 
-// 接收前端更新节点位置的请求体
 #[derive(Deserialize)]
 pub struct UpdateNodePosReq {
     pub pos_x: f64,
@@ -65,6 +70,7 @@ pub struct Edge {
 
 #[derive(Deserialize)]
 pub struct CreateEdgeReq {
+    pub roadmap_id: Uuid, // 显式要求归属
     pub source: Uuid,
     pub target: Uuid,
 }
@@ -80,7 +86,6 @@ pub struct UpdateNoteReq {
     pub content: serde_json::Value,
 }
 
-// 增加分享相关的模型
 #[derive(Serialize, Deserialize, FromRow)]
 pub struct Roadmap {
     pub id: Uuid,
@@ -95,257 +100,164 @@ pub struct ShareData {
     pub edges: Vec<Edge>,
 }
 
+// JWT 提取器
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for Claims
+where S: Send + Sync,
+{
+    type Rejection = (StatusCode, String);
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let auth_header = parts.headers.get("Authorization").and_then(|h| h.to_str().ok()).ok_or((StatusCode::UNAUTHORIZED, "未登录".to_string()))?;
+        if !auth_header.starts_with("Bearer ") { return Err((StatusCode::UNAUTHORIZED, "Token格式错误".to_string())); }
+        let token = &auth_header[7..];
+        let token_data = decode::<Claims>(token, &DecodingKey::from_secret("secret".as_ref()), &Validation::default())
+            .map_err(|_| (StatusCode::UNAUTHORIZED, "会话过期".to_string()))?;
+        Ok(token_data.claims)
+    }
+}
+
 // ==========================================
-// 2. API 处理函数 (Handlers)
+// 2. 认证逻辑
 // ==========================================
 
-// 注册接口：创建用户 + 自动创建默认组织
-async fn register(
-    State(pool): State<PgPool>,
-    Json(payload): Json<AuthReq>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let hashed = hash(payload.password, DEFAULT_COST).unwrap();
+async fn register(State(pool): State<PgPool>, Json(payload): Json<AuthReq>) -> Result<StatusCode, (StatusCode, String)> {
     let email = payload.email.ok_or((StatusCode::BAD_REQUEST, "邮箱必填".to_string()))?;
-    
+    let hashed = hash(payload.password, DEFAULT_COST).unwrap();
     let mut tx = pool.begin().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // 插入数据：nickname = username, email = email
-    let user_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO users (nickname, email, password_hash) VALUES ($1, $2, $3) RETURNING id"
-    )
-    .bind(payload.username)
-    .bind(email)
-    .bind(hashed)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|_| (StatusCode::BAD_REQUEST, "用户名或邮箱已被占用".to_string()))?;
+    let user_id: Uuid = sqlx::query_scalar("INSERT INTO users (nickname, email, password_hash) VALUES ($1, $2, $3) RETURNING id")
+        .bind(payload.username).bind(email).bind(hashed).fetch_one(&mut *tx).await
+        .map_err(|_| (StatusCode::BAD_REQUEST, "用户名或邮箱占用".to_string()))?;
 
-    // 自动创建默认组织
-    sqlx::query("INSERT INTO organizations (name, owner_id) VALUES ($1, $2)")
-        .bind("我的空间")
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let org_id: Uuid = sqlx::query_scalar("INSERT INTO organizations (name, owner_id) VALUES ($1, $2) RETURNING id")
+        .bind("默认空间").bind(user_id).fetch_one(&mut *tx).await.unwrap();
 
-    tx.commit().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    sqlx::query("INSERT INTO roadmaps (org_id, title, share_token) VALUES ($1, $2, $3)")
+        .bind(org_id).bind("我的首个研究路径").bind(Uuid::new_v4().to_string()[..8].to_string()).execute(&mut *tx).await.unwrap();
+
+    tx.commit().await.unwrap();
     Ok(StatusCode::CREATED)
 }
 
-// 登录接口：验证密码 + 返回 JWT
-async fn login(
-    State(pool): State<PgPool>,
-    Json(payload): Json<AuthReq>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // 通过 nickname (用户名) 查找用户
-    let (id, hash_val): (Uuid, String) = sqlx::query_as("SELECT id, password_hash FROM users WHERE nickname = $1")
-        .bind(payload.username)
-        .fetch_optional(&pool)
-        .await
-        .unwrap()
+async fn login(State(pool): State<PgPool>, Json(payload): Json<AuthReq>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (id, hash_val): (Uuid, String) = sqlx::query_as("SELECT id, password_hash FROM users WHERE nickname = $1").bind(payload.username).fetch_optional(&pool).await.unwrap()
         .ok_or((StatusCode::UNAUTHORIZED, "用户不存在".to_string()))?;
-
     if verify(payload.password, &hash_val).unwrap() {
         let claims = Claims { sub: id, exp: 10000000000 }; 
         let token = encode(&Header::default(), &claims, &EncodingKey::from_secret("secret".as_ref())).unwrap();
         Ok(Json(serde_json::json!({ "token": token })))
-    } else {
-        Err((StatusCode::UNAUTHORIZED, "密码错误".to_string()))
-    }
+    } else { Err((StatusCode::UNAUTHORIZED, "密码错误".to_string())) }
 }
 
-// 根据 share_token 获取整个路线图的数据 (只读)
-async fn get_shared_roadmap(
-    Path(token): Path<String>,
-    State(pool): State<PgPool>,
-) -> Result<Json<ShareData>, (StatusCode, String)> {
-    // 1. 先查 roadmap
-    let roadmap = sqlx::query_as::<_, Roadmap>("SELECT id, title, share_token FROM roadmaps WHERE share_token = $1")
-        .bind(&token)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "分享链接已失效".to_string()))?;
+// ==========================================
+// 3. 业务逻辑 (已适配 Roadmap 隔离)
+// ==========================================
 
-    // 2. 查该 roadmap 下的所有节点和连线
-    let nodes = sqlx::query_as::<_, Node>("SELECT id, roadmap_id, title, status, pos_x, pos_y FROM nodes WHERE roadmap_id = $1")
-        .bind(roadmap.id)
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let edges = sqlx::query_as::<_, Edge>("SELECT id, roadmap_id, source_node_id, target_node_id FROM edges WHERE roadmap_id = $1")
-        .bind(roadmap.id)
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(ShareData {
-        roadmap_title: roadmap.title,
-        nodes,
-        edges,
-    }))
-}
-
-// 获取所有节点 (暂时不分路线图，获取所有供测试)
-async fn get_all_nodes(State(pool): State<PgPool>) -> Result<Json<Vec<Node>>, (StatusCode, String)> {
-    let query_str = "SELECT id, roadmap_id, title, status, pos_x, pos_y FROM nodes";
-    
-    match sqlx::query_as::<_, Node>(query_str).fetch_all(&pool).await {
-        Ok(nodes) => Ok(Json(nodes)),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    }
-}
-
-// 创建新节点
-async fn create_node(
-    State(pool): State<PgPool>,
-    Json(payload): Json<CreateNodeReq>,
-) -> Result<(StatusCode, Json<Node>), (StatusCode, String)> {
-    let query_str = "
-        INSERT INTO nodes (title, pos_x, pos_y) 
-        VALUES ($1, $2, $3) 
-        RETURNING id, roadmap_id, title, status, pos_x, pos_y
-    ";
-    
-    match sqlx::query_as::<_, Node>(query_str)
-        .bind(payload.title)
-        .bind(payload.pos_x)
-        .bind(payload.pos_y)
-        .fetch_one(&pool)
-        .await
-    {
-        Ok(node) => Ok((StatusCode::CREATED, Json(node))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    }
-}
-
-// 更新节点位置 (拖拽节点时触发)
-async fn update_node_position(
-    Path(id): Path<Uuid>,
-    State(pool): State<PgPool>,
-    Json(payload): Json<UpdateNodePosReq>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let query_str = "UPDATE nodes SET pos_x = $1, pos_y = $2 WHERE id = $3";
-    
-    match sqlx::query(query_str)
-        .bind(payload.pos_x)
-        .bind(payload.pos_y)
-        .bind(id)
-        .execute(&pool)
-        .await
-    {
-        Ok(_) => Ok(StatusCode::OK),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    }
-}
-
-// 健康检查
-async fn health_check() -> &'static str {
-    "Pathio API is running!"
-}
-
-// 获取所有连线
-async fn get_all_edges(State(pool): State<PgPool>) -> Result<Json<Vec<Edge>>, (StatusCode, String)> {
-    let query = "SELECT id, roadmap_id, source_node_id, target_node_id FROM edges";
-    match sqlx::query_as::<_, Edge>(query).fetch_all(&pool).await {
-        Ok(edges) => Ok(Json(edges)),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    }
-}
-
-// 保存新连线
-async fn create_edge(
-    State(pool): State<PgPool>,
-    Json(payload): Json<CreateEdgeReq>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let query = "INSERT INTO edges (source_node_id, target_node_id) VALUES ($1, $2) ON CONFLICT DO NOTHING";
-    match sqlx::query(query)
-        .bind(payload.source)
-        .bind(payload.target)
-        .execute(&pool)
-        .await 
-    {
-        Ok(_) => Ok(StatusCode::CREATED),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    }
-}
-
-// 获取或初始化笔记
-async fn get_node_note(
-    Path(id): Path<Uuid>,
+// 获取分享路线图中的具体节点笔记 (无需登录)
+async fn get_shared_note(
+    Path((token, node_id)): Path<(String, Uuid)>,
     State(pool): State<PgPool>,
 ) -> Result<Json<Note>, (StatusCode, String)> {
-    // 如果没有笔记，初始化一个空的 JSON 对象 {"text": ""}
-    let default_content = serde_json::json!({"text": ""});
-    
+    // 校验：该 node_id 必须属于这个 share_token 对应的路线图
     let query = "
-        INSERT INTO notes (node_id, content) VALUES ($1, $2)
-        ON CONFLICT (node_id) DO UPDATE SET node_id = EXCLUDED.node_id
-        RETURNING node_id, content
+        SELECT n.node_id, n.content FROM notes n
+        JOIN nodes nd ON n.node_id = nd.id
+        JOIN roadmaps r ON nd.roadmap_id = r.id
+        WHERE r.share_token = $1 AND n.node_id = $2
     ";
-    
-    match sqlx::query_as::<_, Note>(query)
-        .bind(id)
-        .bind(default_content)
-        .fetch_one(&pool)
-        .await 
-    {
+    match sqlx::query_as::<_, Note>(query).bind(token).bind(node_id).fetch_one(&pool).await {
         Ok(note) => Ok(Json(note)),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(_) => Err((StatusCode::FORBIDDEN, "无权访问或内容不存在".to_string())),
     }
 }
 
-// 保存笔记
-async fn update_node_note(
-    Path(id): Path<Uuid>,
-    State(pool): State<PgPool>,
-    Json(payload): Json<UpdateNoteReq>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let query = "UPDATE notes SET content = $1, updated_at = CURRENT_TIMESTAMP WHERE node_id = $2";
-    match sqlx::query(query).bind(payload.content).bind(id).execute(&pool).await {
-        Ok(_) => Ok(StatusCode::OK),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    }
+async fn get_roadmaps(claims: Claims, State(pool): State<PgPool>) -> Result<Json<Vec<Roadmap>>, (StatusCode, String)> {
+    let query = "SELECT r.id, r.title, r.share_token FROM roadmaps r JOIN organizations o ON r.org_id = o.id WHERE o.owner_id = $1 ORDER BY r.created_at DESC";
+    let res = sqlx::query_as::<_, Roadmap>(query).bind(claims.sub).fetch_all(&pool).await.unwrap();
+    Ok(Json(res))
 }
 
-// ==========================================
-// 3. 主程序入口
-// ==========================================
+async fn create_roadmap(claims: Claims, State(pool): State<PgPool>, Json(payload): Json<serde_json::Value>) -> Result<Json<Roadmap>, (StatusCode, String)> {
+    let title = payload["title"].as_str().unwrap_or("未命名路线图");
+    let query = "INSERT INTO roadmaps (org_id, title, share_token) VALUES ((SELECT id FROM organizations WHERE owner_id = $1 LIMIT 1), $2, $3) RETURNING id, title, share_token";
+    let res = sqlx::query_as::<_, Roadmap>(query).bind(claims.sub).bind(title).bind(Uuid::new_v4().to_string()[..8].to_string()).fetch_one(&pool).await.unwrap();
+    Ok(Json(res))
+}
+
+async fn get_all_nodes(claims: Claims, Query(q): Query<RoadmapQuery>, State(pool): State<PgPool>) -> Result<Json<Vec<Node>>, (StatusCode, String)> {
+    let query = "SELECT n.* FROM nodes n JOIN roadmaps r ON n.roadmap_id = r.id JOIN organizations o ON r.org_id = o.id WHERE o.owner_id = $1 AND r.id = $2";
+    let res = sqlx::query_as::<_, Node>(query).bind(claims.sub).bind(q.roadmap_id).fetch_all(&pool).await.unwrap();
+    Ok(Json(res))
+}
+
+async fn create_node(claims: Claims, State(pool): State<PgPool>, Json(payload): Json<CreateNodeReq>) -> Result<(StatusCode, Json<Node>), (StatusCode, String)> {
+    // 校验该路线图是否属于该用户
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM roadmaps r JOIN organizations o ON r.org_id = o.id WHERE r.id = $1 AND o.owner_id = $2)")
+        .bind(payload.roadmap_id).bind(claims.sub).fetch_one(&pool).await.unwrap();
+    if !exists { return Err((StatusCode::FORBIDDEN, "无权访问该路线图".to_string())); }
+
+    let res = sqlx::query_as::<_, Node>("INSERT INTO nodes (roadmap_id, title, pos_x, pos_y) VALUES ($1, $2, $3, $4) RETURNING *")
+        .bind(payload.roadmap_id).bind(payload.title).bind(payload.pos_x).bind(payload.pos_y).fetch_one(&pool).await.unwrap();
+    Ok((StatusCode::CREATED, Json(res)))
+}
+
+async fn update_node_position(claims: Claims, Path(id): Path<Uuid>, State(pool): State<PgPool>, Json(payload): Json<UpdateNodePosReq>) -> Result<StatusCode, (StatusCode, String)> {
+    let query = "UPDATE nodes SET pos_x = $1, pos_y = $2 WHERE id = $3 AND roadmap_id IN (SELECT r.id FROM roadmaps r JOIN organizations o ON r.org_id = o.id WHERE o.owner_id = $4)";
+    let res = sqlx::query(query).bind(payload.pos_x).bind(payload.pos_y).bind(id).bind(claims.sub).execute(&pool).await.unwrap();
+    if res.rows_affected() > 0 { Ok(StatusCode::OK) } else { Err((StatusCode::FORBIDDEN, "操作失败".to_string())) }
+}
+
+async fn get_all_edges(claims: Claims, Query(q): Query<RoadmapQuery>, State(pool): State<PgPool>) -> Result<Json<Vec<Edge>>, (StatusCode, String)> {
+    let query = "SELECT e.* FROM edges e JOIN roadmaps r ON e.roadmap_id = r.id JOIN organizations o ON r.org_id = o.id WHERE o.owner_id = $1 AND r.id = $2";
+    let res = sqlx::query_as::<_, Edge>(query).bind(claims.sub).bind(q.roadmap_id).fetch_all(&pool).await.unwrap();
+    Ok(Json(res))
+}
+
+async fn create_edge(claims: Claims, State(pool): State<PgPool>, Json(payload): Json<CreateEdgeReq>) -> Result<StatusCode, (StatusCode, String)> {
+    let query = "INSERT INTO edges (roadmap_id, source_node_id, target_node_id) SELECT $1, $2, $3 WHERE EXISTS (SELECT 1 FROM roadmaps r JOIN organizations o ON r.org_id = o.id WHERE r.id = $1 AND o.owner_id = $4) ON CONFLICT DO NOTHING";
+    sqlx::query(query).bind(payload.roadmap_id).bind(payload.source).bind(payload.target).bind(claims.sub).execute(&pool).await.unwrap();
+    Ok(StatusCode::CREATED)
+}
+
+async fn get_node_note(claims: Claims, Path(id): Path<Uuid>, State(pool): State<PgPool>) -> Result<Json<Note>, (StatusCode, String)> {
+    let query = "INSERT INTO notes (node_id, content) SELECT $1, '{\"blocks\":[]}' WHERE EXISTS (SELECT 1 FROM nodes n JOIN roadmaps r ON n.roadmap_id = r.id JOIN organizations o ON r.org_id = o.id WHERE n.id = $1 AND o.owner_id = $2) ON CONFLICT (node_id) DO UPDATE SET node_id = EXCLUDED.node_id RETURNING node_id, content";
+    let res = sqlx::query_as::<_, Note>(query).bind(id).bind(claims.sub).fetch_one(&pool).await.map_err(|_| (StatusCode::FORBIDDEN, "无权访问".to_string()))?;
+    Ok(Json(res))
+}
+
+async fn update_node_note(claims: Claims, Path(id): Path<Uuid>, State(pool): State<PgPool>, Json(payload): Json<UpdateNoteReq>) -> Result<StatusCode, (StatusCode, String)> {
+    let query = "UPDATE notes SET content = $1, updated_at = CURRENT_TIMESTAMP WHERE node_id = $2 AND node_id IN (SELECT n.id FROM nodes n JOIN roadmaps r ON n.roadmap_id = r.id JOIN organizations o ON r.org_id = o.id WHERE o.owner_id = $3)";
+    sqlx::query(query).bind(payload.content).bind(id).bind(claims.sub).execute(&pool).await.unwrap();
+    Ok(StatusCode::OK)
+}
+
+async fn get_shared_roadmap(Path(token): Path<String>, State(pool): State<PgPool>) -> Result<Json<ShareData>, (StatusCode, String)> {
+    let roadmap = sqlx::query_as::<_, Roadmap>("SELECT id, title, share_token FROM roadmaps WHERE share_token = $1").bind(&token).fetch_optional(&pool).await.unwrap().ok_or((StatusCode::NOT_FOUND, "无效".to_string()))?;
+    let nodes = sqlx::query_as::<_, Node>("SELECT * FROM nodes WHERE roadmap_id = $1").bind(roadmap.id).fetch_all(&pool).await.unwrap();
+    let edges = sqlx::query_as::<_, Edge>("SELECT * FROM edges WHERE roadmap_id = $1").bind(roadmap.id).fetch_all(&pool).await.unwrap();
+    Ok(Json(ShareData { roadmap_title: roadmap.title, nodes, edges }))
+}
+
+async fn health_check() -> &'static str { "Pathio API Running 🚀" }
 
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    let db_url = std::env::var("DATABASE_URL").expect("未设置 DATABASE_URL");
-    let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string()).parse().unwrap();
-
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&db_url)
-        .await
-        .expect("无法连接数据库");
-
-    println!("✅ 成功连接到 Pathio 数据库!");
-
-    // 配置路由
+    let pool = PgPoolOptions::new().max_connections(5).connect(&std::env::var("DATABASE_URL").unwrap()).await.unwrap();
     let app = Router::new()
         .route("/api/health", get(health_check))
-        // 1. 注册认证相关路由
         .route("/api/auth/register", post(register))
         .route("/api/auth/login", post(login))
-        // 2. 节点与连线路由
         .route("/api/nodes", get(get_all_nodes).post(create_node))
         .route("/api/nodes/:id/position", put(update_node_position))
         .route("/api/edges", get(get_all_edges).post(create_edge))
         .route("/api/nodes/:id/note", get(get_node_note).put(update_node_note))
         .route("/api/share/:token", get(get_shared_roadmap))
-        // 中间件与状态
-        .layer(CorsLayer::permissive())
-        .with_state(pool);
+        .route("/api/roadmaps", get(get_roadmaps).post(create_roadmap))
+        .route("/api/share/:token/notes/:node_id", get(get_shared_note))
+        .layer(CorsLayer::permissive()).with_state(pool);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    println!("🚀 后端服务启动于: http://{}", addr);
-    
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    println!("🚀 Pathio Backend Running at http://127.0.0.1:3000");
     axum::serve(listener, app).await.unwrap();
 }
