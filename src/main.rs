@@ -17,6 +17,13 @@ use jsonwebtoken::{encode, Header, EncodingKey, decode, DecodingKey, Validation}
 // 1. 数据模型定义
 // ==========================================
 
+// 更新节点信息的请求体
+#[derive(Deserialize)]
+pub struct UpdateNodeReq {
+    pub title: Option<String>,
+    pub status: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: Uuid,
@@ -153,6 +160,40 @@ async fn login(State(pool): State<PgPool>, Json(payload): Json<AuthReq>) -> Resu
 // 3. 业务逻辑 (已适配 Roadmap 隔离)
 // ==========================================
 
+// 更新节点标题或状态
+async fn update_node(
+    claims: Claims,
+    Path(id): Path<Uuid>,
+    State(pool): State<PgPool>,
+    Json(payload): Json<UpdateNodeReq>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let query = "
+        UPDATE nodes SET 
+            title = COALESCE($1, title),
+            status = COALESCE($2, status)
+        WHERE id = $3 AND roadmap_id IN (
+            SELECT r.id FROM roadmaps r JOIN organizations o ON r.org_id = o.id WHERE o.owner_id = $4
+        )
+    ";
+    sqlx::query(query).bind(payload.title).bind(payload.status).bind(id).bind(claims.sub).execute(&pool).await.unwrap();
+    Ok(StatusCode::OK)
+}
+
+// 删除节点
+async fn delete_node(
+    claims: Claims,
+    Path(id): Path<Uuid>,
+    State(pool): State<PgPool>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let query = "
+        DELETE FROM nodes WHERE id = $1 AND roadmap_id IN (
+            SELECT r.id FROM roadmaps r JOIN organizations o ON r.org_id = o.id WHERE o.owner_id = $2
+        )
+    ";
+    sqlx::query(query).bind(id).bind(claims.sub).execute(&pool).await.unwrap();
+    Ok(StatusCode::OK)
+}
+
 // 获取分享路线图中的具体节点笔记 (无需登录)
 async fn get_shared_note(
     Path((token, node_id)): Path<(String, Uuid)>,
@@ -255,6 +296,7 @@ async fn main() {
         .route("/api/share/:token", get(get_shared_roadmap))
         .route("/api/roadmaps", get(get_roadmaps).post(create_roadmap))
         .route("/api/share/:token/notes/:node_id", get(get_shared_note))
+        .route("/api/nodes/:id", put(update_node).delete(delete_node))
         .layer(CorsLayer::permissive()).with_state(pool);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
