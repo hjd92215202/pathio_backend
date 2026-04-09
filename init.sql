@@ -65,16 +65,6 @@ CREATE TABLE notes (
 ALTER TABLE nodes ALTER COLUMN roadmap_id DROP NOT NULL;
 
 
--- 1. 创建一个名为“我的深度研究路径”的路线图，并设置分享 token
-INSERT INTO roadmaps (id, title, share_token) 
-VALUES (gen_random_uuid(), '我的第一个研究路径', 'path123');
-
--- 2. 将你目前所有的节点都归属到这个路线图下
-UPDATE nodes SET roadmap_id = (SELECT id FROM roadmaps WHERE share_token = 'path123');
-
--- 3. 将你目前所有的连线也归属过去
-UPDATE edges SET roadmap_id = (SELECT id FROM roadmaps WHERE share_token = 'path123');
-
 -- 1. 确保 nickname 不能为空 (请确保表中现有数据 nickname 都有值，否则会报错)
 ALTER TABLE users ALTER COLUMN nickname SET NOT NULL;
 
@@ -91,5 +81,15 @@ CREATE TABLE invitations (
     inviter_id UUID NOT NULL REFERENCES users(id),
     code VARCHAR(20) UNIQUE NOT NULL,
     is_used BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- 创建节点参考引用表
+CREATE TABLE node_references (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node_id UUID NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );

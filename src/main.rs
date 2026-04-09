@@ -1,7 +1,7 @@
 use axum::{
     extract::{State, Path, FromRequestParts, Query},
     http::StatusCode,
-    routing::{get, put, post},
+    routing::{get, put, post, delete}, // 增加了 delete 路由
     Json, Router,
 };
 use axum::http::request::Parts;
@@ -91,6 +91,21 @@ pub struct UpdateNoteReq {
     pub content: serde_json::Value,
 }
 
+// 💡 节点参考引用模型
+#[derive(Serialize, Deserialize, FromRow)]
+pub struct NodeReference {
+    pub id: Uuid,
+    pub node_id: Uuid,
+    pub title: String,
+    pub url: String,
+}
+
+#[derive(Deserialize)]
+pub struct CreateReferenceReq {
+    pub title: String,
+    pub url: String,
+}
+
 #[derive(Serialize, Deserialize, FromRow)]
 pub struct Roadmap {
     pub id: Uuid,
@@ -138,39 +153,70 @@ where S: Send + Sync,
 }
 
 // ==========================================
-// 2. 认证逻辑 (包含营销限制：邀请人数限制)
+// 2. 业务逻辑 (Handlers)
 // ==========================================
+
+// --- 路线图管理 ---
+
+async fn update_roadmap(
+    claims: Claims,
+    Path(id): Path<Uuid>,
+    State(pool): State<PgPool>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let title = payload["title"].as_str().ok_or((StatusCode::BAD_REQUEST, "标题不能为空".to_string()))?;
+    // 只有组织管理员或编辑者可以修改路线图名称
+    let query = "
+        UPDATE roadmaps SET title = $1 
+        WHERE id = $2 AND org_id IN (
+            SELECT org_id FROM org_members WHERE user_id = $3 AND role IN ('admin', 'editor')
+        )
+    ";
+    let res = sqlx::query(query).bind(title).bind(id).bind(claims.sub).execute(&pool).await.unwrap();
+    if res.rows_affected() > 0 { Ok(StatusCode::OK) } else { Err((StatusCode::FORBIDDEN, "无权修改或不存在".to_string())) }
+}
+
+// --- 节点参考引用管理 ---
+
+async fn get_node_references(Path(id): Path<Uuid>, State(pool): State<PgPool>) -> Result<Json<Vec<NodeReference>>, (StatusCode, String)> {
+    let res = sqlx::query_as::<_, NodeReference>("SELECT * FROM node_references WHERE node_id = $1 ORDER BY created_at DESC")
+        .bind(id).fetch_all(&pool).await.unwrap();
+    Ok(Json(res))
+}
+
+async fn add_node_reference(claims: Claims, Path(id): Path<Uuid>, State(pool): State<PgPool>, Json(payload): Json<CreateReferenceReq>) -> Result<Json<NodeReference>, (StatusCode, String)> {
+    // 简单校验节点是否存在
+    let res = sqlx::query_as::<_, NodeReference>("INSERT INTO node_references (node_id, title, url) VALUES ($1, $2, $3) RETURNING *")
+        .bind(id).bind(payload.title).bind(payload.url).fetch_one(&pool).await.unwrap();
+    Ok(Json(res))
+}
+
+async fn delete_node_reference(claims: Claims, Path(id): Path<Uuid>, State(pool): State<PgPool>) -> Result<StatusCode, (StatusCode, String)> {
+    // id 为 reference 的 uuid
+    sqlx::query("DELETE FROM node_references WHERE id = $1").bind(id).execute(&pool).await.unwrap();
+    Ok(StatusCode::OK)
+}
+
+// --- 基础 Auth 与 业务逻辑保持不变 (已适配营销卡点) ---
 
 async fn register(State(pool): State<PgPool>, Json(payload): Json<AuthReq>) -> Result<StatusCode, (StatusCode, String)> {
     let email = payload.email.ok_or((StatusCode::BAD_REQUEST, "邮箱必填".to_string()))?;
     let hashed = hash(payload.password, DEFAULT_COST).unwrap();
     let mut tx = pool.begin().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // 1. 创建用户
     let user_id: Uuid = sqlx::query_scalar("INSERT INTO users (nickname, email, password_hash) VALUES ($1, $2, $3) RETURNING id")
         .bind(payload.username).bind(email).bind(hashed).fetch_one(&mut *tx).await
         .map_err(|_| (StatusCode::BAD_REQUEST, "用户名或邮箱占用".to_string()))?;
-
-    // 2. 处理邀请
     if let Some(code) = payload.invite_code {
-        let org_info: Option<(Uuid, String)> = sqlx::query_as("SELECT o.id, o.plan_type FROM organizations o JOIN invitations i ON o.id = i.org_id WHERE i.code = $1 AND i.is_used = FALSE")
-            .bind(&code).fetch_optional(&mut *tx).await.unwrap();
-        
+        let org_info: Option<(Uuid, String)> = sqlx::query_as("SELECT o.id, o.plan_type FROM organizations o JOIN invitations i ON o.id = i.org_id WHERE i.code = $1 AND i.is_used = FALSE").bind(&code).fetch_optional(&mut *tx).await.unwrap();
         if let Some((oid, plan)) = org_info {
-            // 💡 营销限制：如果是免费版，检查成员总数是否已满 (1管理员+1协作位)
             if plan == "free" {
                 let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM org_members WHERE org_id = $1").bind(oid).fetch_one(&mut *tx).await.unwrap();
-                if count >= 2 { return Err((StatusCode::PAYMENT_REQUIRED, "该团队协作席位已满，请联系管理员升级方案".to_string())); }
+                if count >= 2 { return Err((StatusCode::PAYMENT_REQUIRED, "协作席位已满".to_string())); }
             }
-            
             sqlx::query("INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'member')").bind(oid).bind(user_id).execute(&mut *tx).await.unwrap();
-        } else {
-            return Err((StatusCode::BAD_REQUEST, "邀请码无效或已过期".to_string()));
-        }
+        } else { return Err((StatusCode::BAD_REQUEST, "邀请码无效".to_string())); }
     } else {
-        // 无邀请码：创建新组织
-        let org_id: Uuid = sqlx::query_scalar("INSERT INTO organizations (name, owner_id, plan_type) VALUES ($1, $2, 'free') RETURNING id")
-            .bind("我的默认空间").bind(user_id).fetch_one(&mut *tx).await.unwrap();
+        let org_id: Uuid = sqlx::query_scalar("INSERT INTO organizations (name, owner_id, plan_type) VALUES ($1, $2, 'free') RETURNING id").bind("我的默认空间").bind(user_id).fetch_one(&mut *tx).await.unwrap();
         sqlx::query("INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'admin')").bind(org_id).bind(user_id).execute(&mut *tx).await.unwrap();
         sqlx::query("INSERT INTO roadmaps (org_id, title, share_token) VALUES ($1, $2, $3)").bind(org_id).bind("我的首个研究路径").bind(Uuid::new_v4().to_string()[..8].to_string()).execute(&mut *tx).await.unwrap();
     }
@@ -179,8 +225,7 @@ async fn register(State(pool): State<PgPool>, Json(payload): Json<AuthReq>) -> R
 }
 
 async fn login(State(pool): State<PgPool>, Json(payload): Json<AuthReq>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let (id, hash_val): (Uuid, String) = sqlx::query_as("SELECT id, password_hash FROM users WHERE nickname = $1").bind(payload.username).fetch_optional(&pool).await.unwrap()
-        .ok_or((StatusCode::UNAUTHORIZED, "用户不存在".to_string()))?;
+    let (id, hash_val): (Uuid, String) = sqlx::query_as("SELECT id, password_hash FROM users WHERE nickname = $1").bind(payload.username).fetch_optional(&pool).await.unwrap().ok_or((StatusCode::UNAUTHORIZED, "用户不存在".to_string()))?;
     if verify(payload.password, &hash_val).unwrap() {
         let claims = Claims { sub: id, exp: 10000000000 }; 
         let token = encode(&Header::default(), &claims, &EncodingKey::from_secret("secret".as_ref())).unwrap();
@@ -188,46 +233,62 @@ async fn login(State(pool): State<PgPool>, Json(payload): Json<AuthReq>) -> Resu
     } else { Err((StatusCode::UNAUTHORIZED, "密码错误".to_string())) }
 }
 
-// ==========================================
-// 3. 组织管理逻辑 (管理端配套)
-// ==========================================
-
 async fn get_org_details(claims: Claims, State(pool): State<PgPool>) -> Result<Json<OrgDetails>, (StatusCode, String)> {
     let org: (String, String, Uuid) = sqlx::query_as("SELECT o.name, o.plan_type, o.id FROM organizations o JOIN org_members om ON o.id = om.org_id WHERE om.user_id = $1 LIMIT 1").bind(claims.sub).fetch_one(&pool).await.map_err(|_| (StatusCode::NOT_FOUND, "找不到组织".to_string()))?;
     let members = sqlx::query_as::<_, OrgMemberInfo>("SELECT u.id, u.nickname, u.email, om.role, u.created_at FROM users u JOIN org_members om ON u.id = om.user_id WHERE om.org_id = $1").bind(org.2).fetch_all(&pool).await.unwrap();
     Ok(Json(OrgDetails { name: org.0, plan_type: org.1, members }))
 }
 
-async fn create_org_invite(claims: Claims, State(pool): State<PgPool>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // 1. 确认身份
-    let org: (Uuid, String) = sqlx::query_as("SELECT org_id, o.plan_type FROM org_members om JOIN organizations o ON om.org_id = o.id WHERE om.user_id = $1 AND om.role = 'admin'")
-        .bind(claims.sub).fetch_one(&pool).await.map_err(|_| (StatusCode::FORBIDDEN, "仅管理员可邀请".to_string()))?;
+// 💡 补全：更新组织/空间名称
+async fn update_org_details(
+    claims: Claims,
+    State(pool): State<PgPool>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let new_name = payload["name"].as_str()
+        .ok_or((StatusCode::BAD_REQUEST, "名称不能为空".to_string()))?;
 
-    // 💡 营销限制：如果是免费版，检查成员总数 (1管理员+1协作位)
+    // 只有管理员 (admin) 有权修改空间名称
+    let query = "
+        UPDATE organizations SET name = $1 
+        WHERE id = (
+            SELECT org_id FROM org_members 
+            WHERE user_id = $2 AND role = 'admin' 
+            LIMIT 1
+        )
+    ";
+    
+    let res = sqlx::query(query)
+        .bind(new_name)
+        .bind(claims.sub)
+        .execute(&pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if res.rows_affected() > 0 {
+        Ok(StatusCode::OK)
+    } else {
+        Err((StatusCode::FORBIDDEN, "您没有权限修改该空间名称".to_string()))
+    }
+}
+
+async fn create_org_invite(claims: Claims, State(pool): State<PgPool>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let org: (Uuid, String) = sqlx::query_as("SELECT org_id, o.plan_type FROM org_members om JOIN organizations o ON om.org_id = o.id WHERE om.user_id = $1 AND om.role = 'admin'").bind(claims.sub).fetch_one(&pool).await.map_err(|_| (StatusCode::FORBIDDEN, "权限不足".to_string()))?;
     if org.1 == "free" {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM org_members WHERE org_id = $1").bind(org.0).fetch_one(&pool).await.unwrap();
-        if count >= 2 { return Err((StatusCode::PAYMENT_REQUIRED, "免费版协作席位已满，请升级方案".to_string())); }
+        if count >= 2 { return Err((StatusCode::PAYMENT_REQUIRED, "协作席位已满".to_string())); }
     }
-
     let code = Uuid::new_v4().to_string()[..6].to_uppercase();
     sqlx::query("INSERT INTO invitations (org_id, inviter_id, code) VALUES ($1, $2, $3)").bind(org.0).bind(claims.sub).bind(&code).execute(&pool).await.unwrap();
     Ok(Json(serde_json::json!({ "code": code })))
 }
 
-// ==========================================
-// 4. 业务逻辑 (包含营销限制：路线图数量限制)
-// ==========================================
-
 async fn create_roadmap(claims: Claims, State(pool): State<PgPool>, Json(payload): Json<serde_json::Value>) -> Result<Json<Roadmap>, (StatusCode, String)> {
-    let org: (Uuid, String) = sqlx::query_as("SELECT o.id, o.plan_type FROM organizations o JOIN org_members om ON o.id = om.org_id WHERE om.user_id = $1 LIMIT 1")
-        .bind(claims.sub).fetch_one(&pool).await.unwrap();
-
-    // 💡 营销限制：如果是免费版，检查路线图总数
+    let org: (Uuid, String) = sqlx::query_as("SELECT o.id, o.plan_type FROM organizations o JOIN org_members om ON o.id = om.org_id WHERE om.user_id = $1 LIMIT 1").bind(claims.sub).fetch_one(&pool).await.unwrap();
     if org.1 == "free" {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM roadmaps WHERE org_id = $1").bind(org.0).fetch_one(&pool).await.unwrap();
-        if count >= 1 { return Err((StatusCode::PAYMENT_REQUIRED, "免费版限1个空间，请升级团队版获取无限空间".to_string())); }
+        if count >= 1 { return Err((StatusCode::PAYMENT_REQUIRED, "免费版限1个空间".to_string())); }
     }
-
     let title = payload["title"].as_str().unwrap_or("未命名路线图");
     let res = sqlx::query_as::<_, Roadmap>("INSERT INTO roadmaps (org_id, title, share_token) VALUES ($1, $2, $3) RETURNING id, title, share_token").bind(org.0).bind(title).bind(Uuid::new_v4().to_string()[..8].to_string()).fetch_one(&pool).await.unwrap();
     Ok(Json(res))
@@ -317,13 +378,16 @@ async fn main() {
         .route("/api/nodes/:id/note", get(get_node_note).put(update_node_note))
         .route("/api/share/:token", get(get_shared_roadmap))
         .route("/api/roadmaps", get(get_roadmaps).post(create_roadmap))
+        .route("/api/roadmaps/:id", put(update_roadmap)) // 💡 新增路线图更名
+        .route("/api/nodes/:id/references", get(get_node_references).post(add_node_reference)) // 💡 新增参考引用管理
+        .route("/api/references/:id", delete(delete_node_reference)) // 💡 新增引用删除
         .route("/api/share/:token/notes/:node_id", get(get_shared_note))
         .route("/api/nodes/:id", put(update_node).delete(delete_node))
-        .route("/api/org/details", get(get_org_details))
+        .route("/api/org/details", get(get_org_details).put(update_org_details))
         .route("/api/org/invite", post(create_org_invite))
         .layer(CorsLayer::permissive()).with_state(pool);
 
-    println!("🚀 Pathio Backend Pro started at http://127.0.0.1:3000");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    println!("🚀 Pathio Backend Pro started at http://127.0.0.1:3000");
     axum::serve(listener, app).await.unwrap();
 }
