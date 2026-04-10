@@ -6,6 +6,7 @@ use axum::{
 };
 use axum::http::request::Parts;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
@@ -140,6 +141,48 @@ pub struct OrgMemberInfo {
     pub email: String,
     pub role: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn normalize_note_content_for_storage(content: Value) -> Value {
+    match content {
+        Value::String(markdown) => json!({ "markdown": markdown, "doc_json": null }),
+        Value::Object(mut map) => {
+            if !map.contains_key("markdown") {
+                let markdown = map
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                map.insert("markdown".to_string(), Value::String(markdown));
+            }
+
+            if !map.contains_key("doc_json") {
+                map.insert("doc_json".to_string(), Value::Null);
+            }
+
+            Value::Object(map)
+        }
+        Value::Null => json!({ "markdown": "", "doc_json": null }),
+        other => json!({ "markdown": other.to_string(), "doc_json": null }),
+    }
+}
+
+fn normalize_note_content_for_response(content: Value) -> Value {
+    let normalized = normalize_note_content_for_storage(content);
+
+    if let Value::Object(mut map) = normalized {
+        if !matches!(map.get("markdown"), Some(Value::String(_))) {
+            map.insert("markdown".to_string(), Value::String(String::new()));
+        }
+
+        if !map.contains_key("doc_json") {
+            map.insert("doc_json".to_string(), Value::Null);
+        }
+
+        return Value::Object(map);
+    }
+
+    normalized
 }
 
 // JWT 鎻愬彇鍣?
@@ -405,13 +448,15 @@ async fn create_edge(claims: Claims, State(pool): State<PgPool>, Json(payload): 
 }
 
 async fn get_node_note(claims: Claims, Path(id): Path<Uuid>, State(pool): State<PgPool>) -> Result<Json<Note>, (StatusCode, String)> {
-    let res = sqlx::query_as::<_, Note>("INSERT INTO notes (node_id, content) SELECT $1, '{\"content\":[]}' WHERE EXISTS (SELECT 1 FROM nodes n JOIN roadmaps r ON n.roadmap_id = r.id JOIN org_members om ON r.org_id = om.org_id WHERE n.id = $1 AND om.user_id = $2) ON CONFLICT (node_id) DO UPDATE SET node_id = EXCLUDED.node_id RETURNING node_id, content").bind(id).bind(claims.sub).fetch_one(&pool).await.map_err(|_| (StatusCode::FORBIDDEN, "Forbidden".to_string()))?;
+    let mut res = sqlx::query_as::<_, Note>("INSERT INTO notes (node_id, content) SELECT $1, '{\"markdown\":\"\",\"doc_json\":null}' WHERE EXISTS (SELECT 1 FROM nodes n JOIN roadmaps r ON n.roadmap_id = r.id JOIN org_members om ON r.org_id = om.org_id WHERE n.id = $1 AND om.user_id = $2) ON CONFLICT (node_id) DO UPDATE SET node_id = EXCLUDED.node_id RETURNING node_id, content").bind(id).bind(claims.sub).fetch_one(&pool).await.map_err(|_| (StatusCode::FORBIDDEN, "Forbidden".to_string()))?;
+    res.content = normalize_note_content_for_response(res.content);
     Ok(Json(res))
 }
 
 async fn update_node_note(claims: Claims, Path(id): Path<Uuid>, State(pool): State<PgPool>, Json(payload): Json<UpdateNoteReq>) -> Result<StatusCode, (StatusCode, String)> {
     let query = "UPDATE notes SET content = $1, updated_at = CURRENT_TIMESTAMP WHERE node_id = $2 AND node_id IN (SELECT n.id FROM nodes n JOIN roadmaps r ON n.roadmap_id = r.id JOIN org_members om ON r.org_id = om.org_id WHERE om.user_id = $3)";
-    sqlx::query(query).bind(payload.content).bind(id).bind(claims.sub).execute(&pool).await.unwrap();
+    let normalized_content = normalize_note_content_for_storage(payload.content);
+    sqlx::query(query).bind(normalized_content).bind(id).bind(claims.sub).execute(&pool).await.unwrap();
     Ok(StatusCode::OK)
 }
 
@@ -439,7 +484,9 @@ async fn get_shared_note(Path((token, node_id)): Path<(String, Uuid)>, State(poo
         .fetch_optional(&pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .unwrap_or_else(|| serde_json::Value::String(String::new()));
+        .unwrap_or_else(|| json!({ "markdown": "", "doc_json": null }));
+
+    let normalized_content = normalize_note_content_for_response(content);
 
     let references = sqlx::query_as::<_, NodeReference>(
         r#"SELECT nr.id, nr.node_id, nr.title, nr.url
@@ -455,7 +502,7 @@ async fn get_shared_note(Path((token, node_id)): Path<(String, Uuid)>, State(poo
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(ShareNoteResponse { content, references }))
+    Ok(Json(ShareNoteResponse { content: normalized_content, references }))
 }
 
 async fn get_shared_roadmap(Path(token): Path<String>, State(pool): State<PgPool>) -> Result<Json<ShareData>, (StatusCode, String)> {
