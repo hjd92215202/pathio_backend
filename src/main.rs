@@ -13,6 +13,9 @@ use uuid::Uuid;
 use bcrypt::{hash, verify, DEFAULT_COST};
 use jsonwebtoken::{encode, Header, EncodingKey, decode, DecodingKey, Validation};
 
+const FREE_MAX_ROADMAPS: i64 = 3;
+const FREE_MAX_NODES_PER_ORG: i64 = 50;
+
 // ==========================================
 // 1. 鏁版嵁妯″瀷瀹氫箟
 // ==========================================
@@ -394,13 +397,41 @@ async fn create_org_invite(claims: Claims, State(pool): State<PgPool>) -> Result
 }
 
 async fn create_roadmap(claims: Claims, State(pool): State<PgPool>, Json(payload): Json<serde_json::Value>) -> Result<Json<Roadmap>, (StatusCode, String)> {
-    let org: (Uuid, String) = sqlx::query_as("SELECT o.id, o.plan_type FROM organizations o JOIN org_members om ON o.id = om.org_id WHERE om.user_id = $1 LIMIT 1").bind(claims.sub).fetch_one(&pool).await.unwrap();
-    if org.1 == "free" {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM roadmaps WHERE org_id = $1").bind(org.0).fetch_one(&pool).await.unwrap();
-        if count >= 1 { return Err((StatusCode::PAYMENT_REQUIRED, "Free plan is limited to one roadmap".to_string())); }
-    }
     let title = payload["title"].as_str().unwrap_or("Untitled roadmap");
-    let res = sqlx::query_as::<_, Roadmap>("INSERT INTO roadmaps (org_id, title, share_token) VALUES ($1, $2, $3) RETURNING id, title, share_token").bind(org.0).bind(title).bind(Uuid::new_v4().to_string()[..8].to_string()).fetch_one(&pool).await.unwrap();
+    let mut tx = pool.begin().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let org: (Uuid, String) = sqlx::query_as("SELECT o.id, o.plan_type FROM organizations o JOIN org_members om ON o.id = om.org_id WHERE om.user_id = $1 LIMIT 1")
+        .bind(claims.sub)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::FORBIDDEN, "Permission denied".to_string()))?;
+
+    // Serialize quota checks inside a txn to avoid concurrent limit bypass.
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM organizations WHERE id = $1 FOR UPDATE")
+        .bind(org.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if org.1 == "free" {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM roadmaps WHERE org_id = $1")
+            .bind(org.0)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if count >= FREE_MAX_ROADMAPS {
+            return Err((StatusCode::PAYMENT_REQUIRED, format!("Free plan is limited to {} roadmaps", FREE_MAX_ROADMAPS)));
+        }
+    }
+
+    let res = sqlx::query_as::<_, Roadmap>("INSERT INTO roadmaps (org_id, title, share_token) VALUES ($1, $2, $3) RETURNING id, title, share_token")
+        .bind(org.0)
+        .bind(title)
+        .bind(Uuid::new_v4().to_string()[..8].to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(res))
 }
 
@@ -415,9 +446,43 @@ async fn get_all_nodes(claims: Claims, Query(q): Query<RoadmapQuery>, State(pool
 }
 
 async fn create_node(claims: Claims, State(pool): State<PgPool>, Json(payload): Json<CreateNodeReq>) -> Result<(StatusCode, Json<Node>), (StatusCode, String)> {
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM roadmaps r JOIN org_members om ON r.org_id = om.org_id WHERE r.id = $1 AND om.user_id = $2)").bind(payload.roadmap_id).bind(claims.sub).fetch_one(&pool).await.unwrap();
-    if !exists { return Err((StatusCode::FORBIDDEN, "Forbidden".to_string())); }
-    let res = sqlx::query_as::<_, Node>("INSERT INTO nodes (roadmap_id, title, pos_x, pos_y) VALUES ($1, $2, $3, $4) RETURNING *").bind(payload.roadmap_id).bind(payload.title).bind(payload.pos_x).bind(payload.pos_y).fetch_one(&pool).await.unwrap();
+    let mut tx = pool.begin().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let org_and_plan: (Uuid, String) = sqlx::query_as("SELECT r.org_id, o.plan_type FROM roadmaps r JOIN organizations o ON r.org_id = o.id JOIN org_members om ON r.org_id = om.org_id WHERE r.id = $1 AND om.user_id = $2 LIMIT 1")
+        .bind(payload.roadmap_id)
+        .bind(claims.sub)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::FORBIDDEN, "Forbidden".to_string()))?;
+
+    // Serialize quota checks inside a txn to avoid concurrent limit bypass.
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM organizations WHERE id = $1 FOR UPDATE")
+        .bind(org_and_plan.0)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if org_and_plan.1 == "free" {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes n JOIN roadmaps r ON n.roadmap_id = r.id WHERE r.org_id = $1")
+            .bind(org_and_plan.0)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        if count >= FREE_MAX_NODES_PER_ORG {
+            return Err((StatusCode::PAYMENT_REQUIRED, format!("Free plan is limited to {} total nodes per workspace", FREE_MAX_NODES_PER_ORG)));
+        }
+    }
+
+    let res = sqlx::query_as::<_, Node>("INSERT INTO nodes (roadmap_id, title, pos_x, pos_y) VALUES ($1, $2, $3, $4) RETURNING *")
+        .bind(payload.roadmap_id)
+        .bind(payload.title)
+        .bind(payload.pos_x)
+        .bind(payload.pos_y)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tx.commit().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok((StatusCode::CREATED, Json(res)))
 }
 
